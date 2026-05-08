@@ -1,7 +1,16 @@
 import fs from "fs/promises";
 import path from "path";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// On Vercel (and most serverless platforms) the project root is READ-ONLY —
+// only /tmp is writable, and it's ephemeral (wiped on cold start).
+// For local dev we keep the data/ folder so leads survive across runs.
+//
+// MIGRATE BEFORE PROD: swap to Supabase / Vercel Postgres / KV. /tmp leads
+// will disappear when the function instance recycles (~minutes of idle).
+const IS_SERVERLESS = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
+const DATA_DIR = IS_SERVERLESS
+  ? "/tmp/pacific-growth-co"
+  : path.join(process.cwd(), "data");
 const LEADS_FILE = path.join(DATA_DIR, "leads.json");
 const LOG_FILE = path.join(DATA_DIR, "notifications.log");
 

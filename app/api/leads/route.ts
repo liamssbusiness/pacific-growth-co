@@ -81,7 +81,17 @@ export async function POST(request: Request) {
       briefing,
     };
 
-    await saveLead(lead);
+    // Storage is best-effort. The user already has their briefing in memory,
+    // and serverless filesystems can fail in surprising ways. Don't drop the
+    // user-facing response just because we couldn't persist the lead.
+    try {
+      await saveLead(lead);
+    } catch (storageErr) {
+      console.error(
+        "[/api/leads] saveLead failed (non-fatal):",
+        storageErr instanceof Error ? storageErr.message : storageErr
+      );
+    }
 
     return NextResponse.json(
       { briefing, competitors, classification },
