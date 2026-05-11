@@ -93,6 +93,23 @@ export async function POST(request: Request) {
       );
     }
 
+    // Structured log so Vercel logs always have a full audit trail even when
+    // /tmp persistence is wiped between cold starts. Searchable as "NEW_LEAD".
+    console.log(
+      "NEW_LEAD",
+      JSON.stringify({
+        id: lead.id,
+        submittedAt: lead.submittedAt,
+        businessName,
+        websiteUrl,
+        email,
+        phone,
+        adSpend,
+        industry,
+        headache,
+      })
+    );
+
     return NextResponse.json(
       { briefing, competitors, classification },
       { status: 200 }

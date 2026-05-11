@@ -56,3 +56,20 @@ export async function saveLead(lead: Lead): Promise<void> {
   const logLine = `${new Date().toISOString()} | ${lead.businessName} | ${lead.email}\n`;
   await fs.appendFile(LOG_FILE, logLine, "utf-8");
 }
+
+/**
+ * Read all leads currently in storage. Used by the admin page.
+ * Returns most-recent-first.
+ *
+ * NOTE: On Vercel this only sees leads saved in the same function instance.
+ * Cold starts wipe /tmp. Treat this as a "recent activity" view, not an archive.
+ */
+export async function getLeads(): Promise<Lead[]> {
+  try {
+    const raw = await fs.readFile(LEADS_FILE, "utf-8");
+    const parsed = JSON.parse(raw) as Lead[];
+    return [...parsed].reverse();
+  } catch {
+    return [];
+  }
+}

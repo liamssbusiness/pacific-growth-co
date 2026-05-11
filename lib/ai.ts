@@ -10,6 +10,19 @@ function getClient(): Anthropic {
 }
 
 /**
+ * Haiku frequently wraps JSON output in markdown code fences even when the
+ * prompt says not to. Strip leading ```json (or ```) and trailing ``` so
+ * downstream JSON.parse() works.
+ */
+function stripJsonFence(s: string): string {
+  return s
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/, "")
+    .trim();
+}
+
+/**
  * SSRF guard — rejects URLs pointing at private/internal/loopback ranges or
  * non-http(s) protocols. Without this, qualifyBusiness() would happily fetch
  * `http://localhost:8080`, `http://10.x.x.x`, or `http://169.254.169.254`
@@ -91,9 +104,10 @@ Respond with only the JSON object. No prose, no markdown, no code fences.`,
 
   const raw =
     message.content[0].type === "text" ? message.content[0].text : "";
+  const cleaned = stripJsonFence(raw);
 
   try {
-    const parsed = JSON.parse(raw) as {
+    const parsed = JSON.parse(cleaned) as {
       classification: string;
       valueProps: string[];
     };
@@ -102,9 +116,10 @@ Respond with only the JSON object. No prose, no markdown, no code fences.`,
       valueProps: Array.isArray(parsed.valueProps) ? parsed.valueProps : [],
     };
   } catch {
-    // If Haiku returns something non-parseable, degrade gracefully
+    // If Haiku returns something non-parseable even after fence stripping,
+    // degrade gracefully and return the raw text minus any leftover fences
     return {
-      classification: raw.trim() || "Business classification unavailable.",
+      classification: cleaned || "Business classification unavailable.",
       valueProps: [],
     };
   }
@@ -141,10 +156,24 @@ No prose, no markdown, no code fences.`,
 
   const raw =
     message.content[0].type === "text" ? message.content[0].text : "[]";
+  const cleaned = stripJsonFence(raw);
 
   try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed as string[];
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) {
+      // Coerce each entry to a string — Haiku occasionally returns objects
+      return parsed
+        .map((item) => {
+          if (typeof item === "string") return item;
+          if (item && typeof item === "object") {
+            const name = (item as Record<string, unknown>).name ?? "";
+            const url = (item as Record<string, unknown>).url ?? (item as Record<string, unknown>).website ?? "";
+            return url ? `${name} (${url})`.trim() : String(name);
+          }
+          return String(item);
+        })
+        .filter(Boolean);
+    }
   } catch {
     // Degrade: return empty list rather than crash
   }
