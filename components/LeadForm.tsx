@@ -1,7 +1,12 @@
 "use client";
 
 import { useState, type FormEvent, type ChangeEvent } from "react";
-import { Loader2, CheckCircle2 } from "lucide-react";
+import { CheckCircle2 } from "lucide-react";
+import AgentSwarm, {
+  INITIAL_SWARM,
+  type SwarmState,
+  type AgentPhase,
+} from "@/components/AgentSwarm";
 
 interface FormData {
   businessName: string;
@@ -13,13 +18,25 @@ interface FormData {
   headache: string;
 }
 
-interface ApiResponse {
+interface FinalResult {
   briefing: string;
   competitors: string[];
   classification: string;
 }
 
 type SubmitState = "idle" | "loading" | "success" | "error";
+
+/** Each SSE event payload from /api/leads. */
+interface StreamEvent {
+  phase: AgentPhase | "start" | "done" | "error";
+  status?: "running" | "complete";
+  classification?: string;
+  valueProps?: string[];
+  competitors?: string[];
+  briefing?: string;
+  message?: string;
+  id?: string;
+}
 
 const initialForm: FormData = {
   businessName: "",
@@ -39,16 +56,18 @@ const labelClass = "mb-1.5 block text-sm font-medium text-stone-700";
 export default function LeadForm() {
   const [form, setForm] = useState<FormData>(initialForm);
   const [state, setState] = useState<SubmitState>("idle");
-  const [result, setResult] = useState<ApiResponse | null>(null);
+  const [result, setResult] = useState<FinalResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>("");
-  const [fieldErrors, setFieldErrors] = useState<Partial<Record<keyof FormData, string>>>({});
+  const [fieldErrors, setFieldErrors] = useState<
+    Partial<Record<keyof FormData, string>>
+  >({});
+  const [swarm, setSwarm] = useState<SwarmState>(INITIAL_SWARM);
 
   function handleChange(
     e: ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>
   ) {
     const { name, value } = e.target;
     setForm((prev) => ({ ...prev, [name]: value }));
-    // Clear field error on change
     if (fieldErrors[name as keyof FormData]) {
       setFieldErrors((prev) => ({ ...prev, [name]: undefined }));
     }
@@ -56,12 +75,17 @@ export default function LeadForm() {
 
   function validate(): boolean {
     const errors: Partial<Record<keyof FormData, string>> = {};
-    if (!form.businessName.trim()) errors.businessName = "Business name is required.";
+    if (!form.businessName.trim())
+      errors.businessName = "Business name is required.";
     if (!form.websiteUrl.trim()) {
       errors.websiteUrl = "Website URL is required.";
     } else {
       try {
-        new URL(form.websiteUrl.startsWith("http") ? form.websiteUrl : `https://${form.websiteUrl}`);
+        new URL(
+          form.websiteUrl.startsWith("http")
+            ? form.websiteUrl
+            : `https://${form.websiteUrl}`
+        );
       } catch {
         errors.websiteUrl = "Enter a valid URL (e.g. https://example.com).";
       }
@@ -78,12 +102,64 @@ export default function LeadForm() {
     return Object.keys(errors).length === 0;
   }
 
+  /** Apply one SSE event to the swarm visual state + accumulate final result. */
+  function applyEvent(evt: StreamEvent, accum: Partial<FinalResult>): void {
+    if (evt.phase === "error") {
+      throw new Error(evt.message ?? "Server stream error.");
+    }
+
+    if (evt.phase === "qualifier") {
+      setSwarm((prev) => ({
+        ...prev,
+        qualifier: {
+          status: evt.status === "complete" ? "complete" : "running",
+          result: evt.classification,
+        },
+      }));
+      if (evt.status === "complete" && evt.classification) {
+        accum.classification = evt.classification;
+      }
+    } else if (evt.phase === "competitors") {
+      setSwarm((prev) => ({
+        ...prev,
+        competitors: {
+          status: evt.status === "complete" ? "complete" : "running",
+          result:
+            evt.status === "complete" && evt.competitors
+              ? evt.competitors.slice(0, 3).join(" · ")
+              : undefined,
+        },
+      }));
+      if (evt.status === "complete" && evt.competitors) {
+        accum.competitors = evt.competitors;
+      }
+    } else if (evt.phase === "briefing") {
+      setSwarm((prev) => ({
+        ...prev,
+        briefing: {
+          status: evt.status === "complete" ? "complete" : "running",
+          result:
+            evt.status === "complete" && evt.briefing
+              ? `${evt.briefing.slice(0, 120)}…`
+              : undefined,
+        },
+      }));
+      if (evt.status === "complete" && evt.briefing) {
+        accum.briefing = evt.briefing;
+      }
+    }
+    // "start" and "done" phases — no UI updates needed beyond completion.
+  }
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     if (!validate()) return;
 
     setState("loading");
     setErrorMsg("");
+    setSwarm(INITIAL_SWARM);
+
+    const accum: Partial<FinalResult> = {};
 
     try {
       const url = form.websiteUrl.startsWith("http")
@@ -96,13 +172,55 @@ export default function LeadForm() {
         body: JSON.stringify({ ...form, websiteUrl: url }),
       });
 
-      const data = await res.json();
-
+      // Validation/auth errors return JSON (not SSE) — handle them.
       if (!res.ok) {
-        throw new Error(data.error ?? "Something went wrong. Please try again.");
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error ?? `Request failed (${res.status}).`);
       }
 
-      setResult(data);
+      if (!res.body) {
+        throw new Error("Streaming not supported by your browser.");
+      }
+
+      // Read SSE chunks: split by "\n\n", parse `data: ...` lines as JSON.
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // Each complete SSE event ends with a blank line ("\n\n")
+        let sepIdx;
+        while ((sepIdx = buffer.indexOf("\n\n")) !== -1) {
+          const chunk = buffer.slice(0, sepIdx);
+          buffer = buffer.slice(sepIdx + 2);
+
+          for (const line of chunk.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+            try {
+              const evt = JSON.parse(payload) as StreamEvent;
+              applyEvent(evt, accum);
+            } catch {
+              // Skip malformed events rather than abort the stream
+            }
+          }
+        }
+      }
+
+      if (!accum.briefing) {
+        throw new Error("Stream ended before briefing was generated.");
+      }
+
+      setResult({
+        briefing: accum.briefing,
+        competitors: accum.competitors ?? [],
+        classification: accum.classification ?? "",
+      });
       setState("success");
     } catch (err) {
       setState("error");
@@ -121,60 +239,78 @@ export default function LeadForm() {
             See exactly where you stand — and what to do about it.
           </h2>
           <p className="mt-4 text-stone-500">
-            Fill this out and our AI will analyze your site + 3 competitors. You&apos;ll
-            see a brief right here, and get the full version by email.
+            Fill this out and watch three AI agents work on your business in
+            real time. Briefing arrives below in ~15 seconds.
           </p>
         </div>
 
+        {state === "loading" && <AgentSwarm swarm={swarm} />}
+
         {state === "success" && result ? (
-          <div className="rounded-2xl border border-teal-200 bg-white p-8">
-            <div className="mb-6 flex items-center gap-3">
-              <CheckCircle2 className="text-teal-500" size={22} />
-              <h3 className="text-base font-semibold text-stone-900">
-                Here&apos;s your AI briefing
-              </h3>
-            </div>
+          <div className="space-y-6">
+            {/* Final swarm snapshot — all three agents done */}
+            <AgentSwarm swarm={swarm} />
 
-            <div className="mb-6 rounded-xl bg-stone-50 p-5">
-              <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-stone-400">
-                Business classification
-              </p>
-              <p className="text-sm text-stone-700">{result.classification}</p>
-            </div>
-
-            {result.competitors.length > 0 && (
-              <div className="mb-6 rounded-xl bg-stone-50 p-5">
-                <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-stone-400">
-                  Competitors identified
-                </p>
-                <ul className="space-y-1">
-                  {result.competitors.map((c, i) => (
-                    <li key={i} className="text-sm text-stone-700">
-                      {c}
-                    </li>
-                  ))}
-                </ul>
+            <div className="rounded-2xl border border-teal-200 bg-white p-8">
+              <div className="mb-6 flex items-center gap-3">
+                <CheckCircle2 className="text-teal-500" size={22} />
+                <h3 className="text-base font-semibold text-stone-900">
+                  Your AI briefing
+                </h3>
               </div>
-            )}
 
-            <div className="rounded-xl bg-teal-50 p-5">
-              <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-teal-700">
-                What we&apos;d do for your business
-              </p>
-              <div className="space-y-3">
-                {result.briefing.split("\n\n").filter(Boolean).map((para, i) => (
-                  <p key={i} className="text-sm leading-relaxed text-stone-700">
-                    {para}
+              {result.classification && (
+                <div className="mb-6 rounded-xl bg-stone-50 p-5">
+                  <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-stone-400">
+                    Business classification
                   </p>
-                ))}
-              </div>
-            </div>
+                  <p className="text-sm text-stone-700">
+                    {result.classification}
+                  </p>
+                </div>
+              )}
 
-            <p className="mt-6 text-xs text-stone-400">
-              The full teardown with specific ad recommendations is on its way to your inbox.
-            </p>
+              {result.competitors.length > 0 && (
+                <div className="mb-6 rounded-xl bg-stone-50 p-5">
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-stone-400">
+                    Competitors identified
+                  </p>
+                  <ul className="space-y-1">
+                    {result.competitors.map((c, i) => (
+                      <li key={i} className="text-sm text-stone-700">
+                        {c}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              <div className="rounded-xl bg-teal-50 p-5">
+                <p className="mb-3 text-xs font-semibold uppercase tracking-widest text-teal-700">
+                  What we&apos;d do for your business
+                </p>
+                <div className="space-y-3">
+                  {result.briefing
+                    .split("\n\n")
+                    .filter(Boolean)
+                    .map((para, i) => (
+                      <p
+                        key={i}
+                        className="text-sm leading-relaxed text-stone-700"
+                      >
+                        {para}
+                      </p>
+                    ))}
+                </div>
+              </div>
+
+              <p className="mt-6 text-xs text-stone-400">
+                The full teardown with specific ad recommendations is on its
+                way to your inbox.
+              </p>
+            </div>
           </div>
-        ) : (
+        ) : state !== "loading" ? (
           <form
             onSubmit={handleSubmit}
             noValidate
@@ -196,10 +332,15 @@ export default function LeadForm() {
                   onChange={handleChange}
                   className={inputClass}
                   aria-invalid={!!fieldErrors.businessName}
-                  aria-describedby={fieldErrors.businessName ? "businessName-err" : undefined}
+                  aria-describedby={
+                    fieldErrors.businessName ? "businessName-err" : undefined
+                  }
                 />
                 {fieldErrors.businessName && (
-                  <p id="businessName-err" className="mt-1 text-xs text-red-500">
+                  <p
+                    id="businessName-err"
+                    className="mt-1 text-xs text-red-500"
+                  >
                     {fieldErrors.businessName}
                   </p>
                 )}
@@ -220,7 +361,9 @@ export default function LeadForm() {
                   onChange={handleChange}
                   className={inputClass}
                   aria-invalid={!!fieldErrors.websiteUrl}
-                  aria-describedby={fieldErrors.websiteUrl ? "websiteUrl-err" : undefined}
+                  aria-describedby={
+                    fieldErrors.websiteUrl ? "websiteUrl-err" : undefined
+                  }
                 />
                 {fieldErrors.websiteUrl && (
                   <p id="websiteUrl-err" className="mt-1 text-xs text-red-500">
@@ -244,7 +387,9 @@ export default function LeadForm() {
                   onChange={handleChange}
                   className={inputClass}
                   aria-invalid={!!fieldErrors.email}
-                  aria-describedby={fieldErrors.email ? "email-err" : undefined}
+                  aria-describedby={
+                    fieldErrors.email ? "email-err" : undefined
+                  }
                 />
                 {fieldErrors.email && (
                   <p id="email-err" className="mt-1 text-xs text-red-500">
@@ -268,7 +413,9 @@ export default function LeadForm() {
                   onChange={handleChange}
                   className={inputClass}
                   aria-invalid={!!fieldErrors.phone}
-                  aria-describedby={fieldErrors.phone ? "phone-err" : undefined}
+                  aria-describedby={
+                    fieldErrors.phone ? "phone-err" : undefined
+                  }
                 />
                 {fieldErrors.phone && (
                   <p id="phone-err" className="mt-1 text-xs text-red-500">
@@ -289,7 +436,9 @@ export default function LeadForm() {
                   onChange={handleChange}
                   className={inputClass}
                   aria-invalid={!!fieldErrors.adSpend}
-                  aria-describedby={fieldErrors.adSpend ? "adSpend-err" : undefined}
+                  aria-describedby={
+                    fieldErrors.adSpend ? "adSpend-err" : undefined
+                  }
                 >
                   <option value="">Select range</option>
                   <option value="$0/day">$0 — just starting</option>
@@ -317,7 +466,9 @@ export default function LeadForm() {
                   onChange={handleChange}
                   className={inputClass}
                   aria-invalid={!!fieldErrors.industry}
-                  aria-describedby={fieldErrors.industry ? "industry-err" : undefined}
+                  aria-describedby={
+                    fieldErrors.industry ? "industry-err" : undefined
+                  }
                 >
                   <option value="">Select industry</option>
                   <option value="e-commerce">E-commerce</option>
@@ -337,7 +488,7 @@ export default function LeadForm() {
             <div className="mt-5">
               <label htmlFor="headache" className={labelClass}>
                 Biggest marketing headache{" "}
-                <span className="text-stone-400 font-normal">(optional)</span>
+                <span className="font-normal text-stone-400">(optional)</span>
               </label>
               <textarea
                 id="headache"
@@ -358,24 +509,16 @@ export default function LeadForm() {
 
             <button
               type="submit"
-              disabled={state === "loading"}
               className="mt-6 flex w-full items-center justify-center gap-2 rounded-full bg-teal-600 px-8 py-4 text-sm font-semibold text-white transition-all duration-200 hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-teal-400 focus:ring-offset-2"
             >
-              {state === "loading" ? (
-                <>
-                  <Loader2 size={16} className="animate-spin" />
-                  Analyzing your business...
-                </>
-              ) : (
-                "Get my free teardown"
-              )}
+              Get my free teardown
             </button>
 
             <p className="mt-3 text-center text-xs text-stone-400">
               No pitch call required. No spam. Just the teardown.
             </p>
           </form>
-        )}
+        ) : null}
       </div>
     </section>
   );
