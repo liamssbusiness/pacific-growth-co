@@ -2,6 +2,7 @@ import { z } from "zod";
 import { randomUUID } from "crypto";
 import { qualifyBusiness, findCompetitors, generateBriefing } from "@/lib/ai";
 import { saveLead, type Lead } from "@/lib/leads";
+import { notifyNewLead } from "@/lib/notify";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -175,6 +176,11 @@ export async function POST(request: Request) {
         );
 
         send({ phase: "done", status: "complete", id: lead.id });
+
+        // Lead alert — ping Discord after the briefing is already delivered so
+        // a slow webhook never delays the visible result. Awaited so the
+        // serverless function isn't frozen before the POST completes.
+        await notifyNewLead(lead);
       } catch (err) {
         const message =
           err instanceof Error ? err.message : "Unexpected server error.";
