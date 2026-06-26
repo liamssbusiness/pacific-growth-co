@@ -14,6 +14,17 @@ Leads are persisted to the filesystem (ephemeral `/tmp` on Vercel, persistent `d
 
 ---
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    F["Lead form"] -->|"POST /api/leads"| S(["SSE stream"])
+    S --> A1["Agent 1 · Business Qualifier<br/>Haiku"]
+    A1 --> A2["Agent 2 · Competitor Scout<br/>Haiku"]
+    A2 --> A3["Agent 3 · Strategy Writer<br/>Sonnet"]
+    A3 --> R["Live strategy briefing"]
+```
+
 ## Features
 
 - **Streaming agent UI** — `AgentSwarm` component renders three agent cards with live `Queued / Working / Done` status pills driven by SSE events from the API route
